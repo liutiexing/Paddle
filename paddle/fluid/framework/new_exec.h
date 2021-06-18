@@ -720,7 +720,7 @@ void ExecutorGraph::PopulateExecInfo(const BlockDesc& block,
   platform::DeviceContextPool& dev_ctx_pool = platform::DeviceContextPool::Instance();
   Scope null_scope;
   // vars for temp run
-  std::vector<std::unique_ptr<Variable>> local_variables(var_infos_.size());
+  std::vector<std::unique_ptr<Variable>> local_variables;
   for (Index i = 0; i < var_infos_.size(); ++i) {
     auto v = new Variable();
     InitializeVariable(v,  var_infos_[i].type);
