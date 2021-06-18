@@ -19,8 +19,10 @@
 #include <iostream>
 #include <string>
 
+#include <set>
 #include <map>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -566,6 +568,297 @@ framework::ProgramDesc load_from_file(const std::string& file_name) {
   ProgramDesc program_desc(buffer);
   return program_desc;
 }
+
+// ============================ GraphExecutor =====================================
+using Index = size_t;
+using Num = size_t;
+using StreamId = int;
+
+enum class SchedType : int8_t {
+  UNKNOWN = -1,
+  CPU_COMPUTE = 0,
+  ACCELERATOR_COMPUTE,
+  DATA_COPY
+};
+
+struct ImmutableSchedInfo {
+  SchedType sched_type{SchedType::UNKNOWN};
+  StreamId stream_id{0};
+  std::vector<Num> output_user_count;
+  std::vector<Index> output_users;
+};
+
+using OpKernelFunc = std::function<void(const ExecutionContext&)>;
+
+struct InstructionFunction {
+  OpKernelFunc kernel_func;
+  std::unique_ptr<OperatorBase> operator_ptr;
+};
+
+struct ExecutionInfo {
+  std::vector<Index> inputs;
+  std::vector<Index> outputs;
+  // input_values, output_values, input_indexes and output_indexes will be 
+  // removed after Compute Unit Refactoring
+  std::vector<std::vector<Index>> input_values;
+  std::vector<std::vector<Index>> output_values;
+  std::map<std::string, Index> input_indexes;
+  std::map<std::string, Index> output_indexes;
+  platform::Place place;
+  InstructionFunction function;
+};
+
+struct Instruction {
+  ImmutableSchedInfo sched_info;
+  ExecutionInfo exec_info;
+};
+
+struct VariableMetaInfo {
+  std::string name;
+  proto::VarType::Type type;
+  bool persistable{false};
+
+  VariableMetaInfo(const std::string& n, proto::VarType::Type t) : name(n), type(t) {}
+};
+
+struct VersionedVariableInfo {
+  Index metainfo;
+  size_t version{1};
+
+  VersionedVariableInfo(Index m, size_t v) : metainfo(m), version(v) {}
+};
+
+class ExecutorGraph {
+ public:
+  void CreateFromProgramDesc(const BlockDesc& block, 
+                             const std::vector<platform::Place>& placement_info);
+
+ private:
+  void BuildVariableInfo(const BlockDesc& block, 
+                         std::unordered_map<std::string, Index>* varname2idx);
+
+  void BuildInstructionInfo(const BlockDesc& block, 
+                            const std::vector<platform::Place>& placement_info, 
+                            const std::unordered_map<std::string, Index>& varname2idx);
+
+  void PopulateSchedInfo(const BlockDesc& block);
+
+  void PopulateExecInfo(const BlockDesc& block, 
+                        const std::vector<platform::Place>& placement_info, 
+                        const std::unordered_map<std::string, Index>& varname2idx);
+
+  std::unique_ptr<RuntimeContextV2> BuildRunCtx(const std::vector<std::unique_ptr<Variable>>& vars, 
+                                              Index inst) const;
+
+  std::vector<Instruction> instructions_;
+  std::vector<VariableMetaInfo> var_infos_;
+  std::vector<VersionedVariableInfo> versioned_var_infos_;
+};
+
+enum class VariableStatus : uint8_t {
+  UNALLOCATED,
+  ALLOCATED,
+  ASSIGNED
+};
+
+struct InstructionState {
+  std::atomic<Num> unallocated_input_num;
+  std::atomic<Num> unassigned_input_num;
+};
+
+struct Register {
+  std::unique_ptr<Variable> variable;
+  VariableStatus var_status;
+};
+
+class ExecutorGraphState {
+ public:
+  ExecutorGraphState(const ExecutorGraph& graph);
+ private:
+  std::vector<InstructionState> inst_states;
+  std::vector<Register> registers;
+};
+
+class AsyncExecutorImpl {
+ public:
+ private:
+  std::shared_ptr<ExecutorGraph> graph_;
+};
+
+class AsyncExecutor {
+ public:
+ private:
+  std::unique_ptr<AsyncExecutorImpl> impl_;
+};
+
+void ExecutorGraph::CreateFromProgramDesc(const BlockDesc& block, 
+                                          const std::vector<platform::Place>& placement_info) {
+  std::unordered_map<std::string, Index> varname2idx;
+  BuildVariableInfo(block, &varname2idx);
+  BuildInstructionInfo(block, placement_info, varname2idx);
+}
+
+void ExecutorGraph::BuildInstructionInfo(const BlockDesc& block, 
+                                         const std::vector<platform::Place>& placement_info, 
+                                         const std::unordered_map<std::string, Index>& varname2idx)
+{
+  size_t op_num = block.AllOps().size();
+  PADDLE_ENFORCE_EQ(op_num, placement_info.size(), 
+                    platform::errors::InvalidArgument("op num: %d, place num: %d", 
+                                                      op_num, placement_info.size()));
+  instructions_.resize(op_num);
+  PopulateExecInfo(block, placement_info, varname2idx);
+  PopulateSchedInfo(block);
+}
+
+void ExecutorGraph::PopulateExecInfo(const BlockDesc& block, 
+                                     const std::vector<platform::Place>& placement_info, 
+                                     const std::unordered_map<std::string, Index>& varname2idx) {
+  const auto all_ops = block.AllOps();
+  std::unordered_map<std::string, Index> name2version;
+  auto& all_op_kernels = OperatorWithKernel::AllOpKernels();
+  platform::DeviceContextPool& dev_ctx_pool = platform::DeviceContextPool::Instance();
+  Scope null_scope;
+  // vars for temp run
+  std::vector<std::unique_ptr<Variable>> local_variables(var_infos_.size());
+  for (Index i = 0; i < var_infos_.size(); ++i) {
+    auto v = new Variable();
+    InitializeVariable(v,  var_infos_[i].type);
+    local_variables.push_back(std::unique_ptr<Variable>(v));
+  }
+  // vars for temp run
+  for (size_t i = 0; i < all_ops.size(); ++i) {
+    const OpDesc& opdesc = *(all_ops[i]);
+    auto& exec_info = instructions_[i].exec_info;
+    std::set<Index> input_dedup;
+    exec_info.input_values.reserve(opdesc.Inputs().size());
+    for (const auto& var_name_map : opdesc.Inputs()) {
+      exec_info.input_indexes[var_name_map.first] = exec_info.input_values.size();
+      exec_info.input_values.push_back({});
+      auto& idx_vec = exec_info.input_values.back();
+      idx_vec.reserve(var_name_map.second.size());
+      for (const auto& var_name : var_name_map.second) {
+        const auto& iter = varname2idx.find(var_name);
+        Index idx = iter->second;
+        idx_vec.push_back(idx);
+        if (name2version.find(var_name) == name2version.end()) {
+          versioned_var_infos_.emplace_back(idx, 1);
+          name2version[var_name] = versioned_var_infos_.size() - 1;
+        }
+        input_dedup.insert(name2version[var_name]);
+      }
+    }
+    exec_info.inputs.reserve(input_dedup.size());
+    exec_info.inputs.insert(exec_info.inputs.begin(), input_dedup.begin(), input_dedup.end());
+    std::set<Index> output_dedup;
+    exec_info.output_values.reserve(opdesc.Outputs().size());
+    for (const auto& var_name_map : opdesc.Outputs()) {
+      exec_info.output_indexes[var_name_map.first] = exec_info.output_values.size();
+      exec_info.output_values.push_back({});
+      auto& idx_vec = exec_info.output_values.back();
+      idx_vec.reserve(var_name_map.second.size());
+      for (const auto& var_name : var_name_map.second) {
+        const auto& iter = varname2idx.find(var_name);
+        Index idx = iter->second;
+        idx_vec.push_back(idx);
+        if (name2version.find(var_name) == name2version.end()) {
+          versioned_var_infos_.emplace_back(idx, 1);
+        }
+        else {
+          auto old_version = versioned_var_infos_[name2version[var_name]].version;
+          versioned_var_infos_.emplace_back(idx, old_version + 1);
+        }
+        name2version[var_name] = versioned_var_infos_.size() - 1;
+        output_dedup.insert(name2version[var_name]);
+      }
+    }
+    exec_info.outputs.reserve(output_dedup.size());
+    exec_info.outputs.insert(exec_info.outputs.begin(), output_dedup.begin(), output_dedup.end());
+    exec_info.place = placement_info[i];
+    exec_info.function.operator_ptr = OpRegistry::CreateOp(opdesc);
+    // infershape, select kernel, exec kernel
+    auto kernels_iter = all_op_kernels.find(opdesc.Type());
+    PADDLE_ENFORCE_NE(kernels_iter, all_op_kernels.end(),
+                      platform::errors::Unavailable(
+                          "There are no kernels which are registered in the %s operator.",
+                          opdesc.Type()));
+    auto run_ctx_ptr = BuildRunCtx(local_variables, i);
+    const auto& op_base = *(exec_info.function.operator_ptr);
+    RuntimeInferShapeContext infershape_ctx(op_base, *run_ctx_ptr);
+    const auto& op_with_kernel = static_cast<const framework::OperatorWithKernel&>(op_base);
+    op_with_kernel.InferShape(&infershape_ctx);
+    const auto& dev_ctx = *(dev_ctx_pool.Get(exec_info.place));
+    ExecutionContextV2 exec_ctx(op_base, null_scope, dev_ctx, *run_ctx_ptr);
+    OpKernelType expected_kernel_type = op_with_kernel.GetExpectedKernelType(exec_ctx);
+    OperatorWithKernel::OpKernelMap& kernels = kernels_iter->second;
+    auto kernel_iter = kernels.find(expected_kernel_type);
+    exec_info.function.kernel_func = OpKernelFunc(kernel_iter->second);
+    exec_info.function.kernel_func(exec_ctx);
+    exec_info.place = expected_kernel_type.place_; // adjust place
+  }
+}
+
+void ExecutorGraph::PopulateSchedInfo(const BlockDesc& block) {
+  std::vector<std::vector<Index>> var_users(versioned_var_infos_.size());
+  for (Index i = 0; i < instructions_.size(); ++i) {
+    for (Index input : instructions_[i].exec_info.inputs) {
+      var_users[input].push_back(i);
+    }
+  }
+  for (Index i = 0; i < instructions_.size(); ++i) {
+    const auto& outputs = instructions_[i].exec_info.outputs;
+    auto& output_user_count = instructions_[i].sched_info.output_user_count;
+    auto& output_users = instructions_[i].sched_info.output_users;
+    output_user_count.reserve(outputs.size());
+    for (Index output : outputs) {
+      output_user_count.push_back(var_users[output].size());
+      output_users.insert(output_users.end(), var_users[output].begin(), var_users[output].end());
+    }
+  }
+}
+
+void ExecutorGraph::BuildVariableInfo(const BlockDesc& block,
+                                      std::unordered_map<std::string, Index>* varname2idx) {
+  var_infos_.reserve(block.AllVars().size());
+  for (const auto& var : block.AllVars()) {
+    if (var->Name() == framework::kEmptyVarName) {
+      continue;
+    }
+    (*varname2idx)[var->Name()] = var_infos_.size();
+    var_infos_.emplace_back(var->Name(), var->GetType());
+  }
+}
+
+std::unique_ptr<RuntimeContextV2> ExecutorGraph::BuildRunCtx(
+        const std::vector<std::unique_ptr<Variable>>& local_vars, Index inst_idx) const {
+  const auto& exec_info = instructions_[inst_idx].exec_info;
+  std::vector<std::vector<Variable*>> input_values;
+  std::vector<std::vector<Variable*>> output_values;  
+ 
+  input_values.resize(exec_info.input_indexes.size());
+  for (const auto& input : exec_info.input_indexes) {
+    auto& vars = input_values[input.second];
+    for (Index var_idx : exec_info.input_values[input.second]) {
+      vars.push_back(local_vars[var_idx].get());
+    }
+  }
+  output_values.resize(exec_info.output_indexes.size());
+  for (const auto& output : exec_info.output_indexes) {
+    auto& vars = output_values[output.second];
+    for (Index var_idx : exec_info.output_values[output.second]) {
+      vars.push_back(local_vars[var_idx].get());
+    }
+  }
+  std::unique_ptr<RuntimeContextV2> run_ctx(new RuntimeContextV2(input_values, 
+                                                             output_values, 
+                                                             exec_info.input_indexes,
+                                                             exec_info.output_indexes));
+  return std::move(run_ctx);
+}
+
+// =======================================================================================
+
+
 
 struct VariableScope {
   std::vector<std::unique_ptr<Variable>> var_list;
