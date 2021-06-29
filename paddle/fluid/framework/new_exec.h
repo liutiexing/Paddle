@@ -569,7 +569,7 @@ framework::ProgramDesc load_from_file(const std::string& file_name) {
   return program_desc;
 }
 
-// ============================ GraphExecutor =====================================
+// ============================ ExecutorGraph =====================================
 using Index = size_t;
 using Num = size_t;
 using StreamId = int;
@@ -591,7 +591,7 @@ struct ImmutableSchedInfo {
 using OpKernelFunc = std::function<void(const ExecutionContext&)>;
 
 struct InstructionFunction {
-  OpKernelFunc kernel_func;
+  OpKernelFunc kernel_func; // set on the first-run
   std::unique_ptr<OperatorBase> operator_ptr;
 };
 
@@ -604,7 +604,7 @@ struct ExecutionInfo {
   std::vector<std::vector<Index>> output_values;
   std::map<std::string, Index> input_indexes;
   std::map<std::string, Index> output_indexes;
-  platform::Place place;
+  platform::Place place; // set by the placement-info, adjust on the first-run
   InstructionFunction function;
 };
 
@@ -616,8 +616,7 @@ struct Instruction {
 struct VariableMetaInfo {
   std::string name;
   proto::VarType::Type type;
-  bool persistable{false};
-
+  
   VariableMetaInfo(const std::string& n, proto::VarType::Type t) : name(n), type(t) {}
 };
 
@@ -628,17 +627,19 @@ struct VersionedVariableInfo {
   VersionedVariableInfo(Index m, size_t v) : metainfo(m), version(v) {}
 };
 
+struct GraphBuildOptions {
+  bool is_startup_prog = false;
+};
+
 class ExecutorGraph {
  public:
-  void CreateFromProgramDesc(const BlockDesc& block, 
-                             const std::vector<platform::Place>& placement_info);
+  ExecutorGraph(const BlockDesc& block, const GraphBuildOptions& options);
 
  private:
   void BuildVariableInfo(const BlockDesc& block, 
                          std::unordered_map<std::string, Index>* varname2idx);
 
   void BuildInstructionInfo(const BlockDesc& block, 
-                            const std::vector<platform::Place>& placement_info, 
                             const std::unordered_map<std::string, Index>& varname2idx);
 
   void PopulateSchedInfo(const BlockDesc& block);
@@ -653,59 +654,28 @@ class ExecutorGraph {
   std::vector<Instruction> instructions_;
   std::vector<VariableMetaInfo> var_infos_;
   std::vector<VersionedVariableInfo> versioned_var_infos_;
+  std::vector<Index> parameters_;
+  std::vector<Index> inputs_;
+  std::vector<Index> outputs_;
 };
 
-enum class VariableStatus : uint8_t {
-  UNALLOCATED,
-  ALLOCATED,
-  ASSIGNED
-};
-
-struct InstructionState {
-  std::atomic<Num> unallocated_input_num;
-  std::atomic<Num> unassigned_input_num;
-};
-
-struct Register {
-  std::unique_ptr<Variable> variable;
-  VariableStatus var_status;
-};
-
-class ExecutorGraphState {
- public:
-  ExecutorGraphState(const ExecutorGraph& graph);
- private:
-  std::vector<InstructionState> inst_states;
-  std::vector<Register> registers;
-};
-
-class AsyncExecutorImpl {
- public:
- private:
-  std::shared_ptr<ExecutorGraph> graph_;
-};
-
-class AsyncExecutor {
- public:
- private:
-  std::unique_ptr<AsyncExecutorImpl> impl_;
-};
-
-void ExecutorGraph::CreateFromProgramDesc(const BlockDesc& block, 
-                                          const std::vector<platform::Place>& placement_info) {
+ExecutorGraph::ExecutorGraph(const BlockDesc& block, 
+                             const GraphBuildOptions& options) {
   std::unordered_map<std::string, Index> varname2idx;
   BuildVariableInfo(block, &varname2idx);
-  BuildInstructionInfo(block, placement_info, varname2idx);
+  BuildInstructionInfo(block, varname2idx);
+  if (options.is_startup_prog) {
+    for (Index i = 0; i < var_infos_.size(); ++i) {
+      parameters_.push_back(i);
+    }
+  }
 }
 
 void ExecutorGraph::BuildInstructionInfo(const BlockDesc& block, 
-                                         const std::vector<platform::Place>& placement_info, 
                                          const std::unordered_map<std::string, Index>& varname2idx)
 {
   size_t op_num = block.AllOps().size();
-  PADDLE_ENFORCE_EQ(op_num, placement_info.size(), 
-                    platform::errors::InvalidArgument("op num: %d, place num: %d", 
-                                                      op_num, placement_info.size()));
+  std::vector<platform::Place> placement_info(op_num, platform::CUDAPlace(0));
   instructions_.resize(op_num);
   PopulateExecInfo(block, placement_info, varname2idx);
   PopulateSchedInfo(block);
@@ -716,7 +686,7 @@ void ExecutorGraph::PopulateExecInfo(const BlockDesc& block,
                                      const std::unordered_map<std::string, Index>& varname2idx) {
   const auto all_ops = block.AllOps();
   std::unordered_map<std::string, Index> name2version;
-  auto& all_op_kernels = OperatorWithKernel::AllOpKernels();
+  /*auto& all_op_kernels = OperatorWithKernel::AllOpKernels();
   platform::DeviceContextPool& dev_ctx_pool = platform::DeviceContextPool::Instance();
   Scope null_scope;
   // vars for temp run
@@ -725,7 +695,7 @@ void ExecutorGraph::PopulateExecInfo(const BlockDesc& block,
     auto v = new Variable();
     InitializeVariable(v,  var_infos_[i].type);
     local_variables.push_back(std::unique_ptr<Variable>(v));
-  }
+  }*/
   // vars for temp run
   for (size_t i = 0; i < all_ops.size(); ++i) {
     const OpDesc& opdesc = *(all_ops[i]);
@@ -777,7 +747,8 @@ void ExecutorGraph::PopulateExecInfo(const BlockDesc& block,
     exec_info.place = placement_info[i];
     exec_info.function.operator_ptr = OpRegistry::CreateOp(opdesc);
     // infershape, select kernel, exec kernel
-    auto kernels_iter = all_op_kernels.find(opdesc.Type());
+
+    /*auto kernels_iter = all_op_kernels.find(opdesc.Type());
     PADDLE_ENFORCE_NE(kernels_iter, all_op_kernels.end(),
                       platform::errors::Unavailable(
                           "There are no kernels which are registered in the %s operator.",
@@ -794,7 +765,7 @@ void ExecutorGraph::PopulateExecInfo(const BlockDesc& block,
     auto kernel_iter = kernels.find(expected_kernel_type);
     exec_info.function.kernel_func = OpKernelFunc(kernel_iter->second);
     exec_info.function.kernel_func(exec_ctx);
-    exec_info.place = expected_kernel_type.place_; // adjust place
+    exec_info.place = expected_kernel_type.place_; // adjust place*/
   }
 }
 
@@ -856,9 +827,38 @@ std::unique_ptr<RuntimeContextV2> ExecutorGraph::BuildRunCtx(
   return std::move(run_ctx);
 }
 
-// =======================================================================================
+// ============================ ExecutorState =====================================
+enum class VariableStatus : uint8_t {
+  UNALLOCATED,
+  ALLOCATED,
+  ASSIGNED
+};
 
+struct InstructionState {
+  std::atomic<Num> unallocated_input_num;
+  std::atomic<Num> unassigned_input_num;
+};
 
+struct Register {
+  std::unique_ptr<Variable> variable;
+  VariableStatus var_status;
+};
+
+class ExecutorState {
+ public:
+  ExecutorState(const ExecutorGraph& graph, std::vector<Variable*> params);
+  void Run(const std::vector<Variable*>& inputs, 
+           std::vector<std::unique_ptr<Variable>>* outputs);
+  std::vector<std::string> GetInputNames();
+  std::vector<std::string> GetOutputNames();
+  std::vector<std::string> GetParameterNames();
+ private:
+  std::vector<InstructionState> inst_states;
+  std::vector<Register> registers;
+  const ExecutorGraph& graph_;
+};
+
+// =========================================== =====================================
 
 struct VariableScope {
   std::vector<std::unique_ptr<Variable>> var_list;
@@ -1269,6 +1269,12 @@ class InterpreterCore {
     paddle::framework::build_op_func_list(startup_prog, op_list, vec_func_list,
                                           &global_scope, place_);
   }
+
+  void ProgramToGraph(const ProgramDesc& programdesc) {
+    GraphBuildOptions options;
+    ExecutorGraph graph(programdesc.Block(0), options);
+  }
+
   void run(const std::vector<std::string> vec_name,
            const std::vector<framework::Tensor>& vec_tensor,
            const std::vector<std::string>& vec_fetch_name,
