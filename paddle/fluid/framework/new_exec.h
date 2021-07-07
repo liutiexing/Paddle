@@ -584,15 +584,21 @@ enum class SchedType : int8_t {
 struct ImmutableSchedInfo {
   SchedType sched_type{SchedType::UNKNOWN};
   StreamId stream_id{0};
-  std::vector<Num> output_user_count;
-  std::vector<Index> output_users;
+  std::vector<std::vector<Index>> output_users;
 };
 
 using OpKernelFunc = std::function<void(const ExecutionContext&)>;
 
 struct InstructionFunction {
-  OpKernelFunc kernel_func; // set on the first-run
+  OpKernelFunc kernel_func = nullptr; // set on the first-run
   std::unique_ptr<OperatorBase> operator_ptr;
+  
+  InstructionFunction() = default;
+ 
+  InstructionFunction(InstructionFunction&& inst) {
+    kernel_func = std::move(inst.kernel_func);
+    operator_ptr = std::move(inst.operator_ptr);
+  }
 };
 
 struct ExecutionInfo {
@@ -615,7 +621,7 @@ struct Instruction {
 
 struct VariableMetaInfo {
   std::string name;
-  proto::VarType::Type type;
+  proto::VarType::Type type{proto::VarType::RAW};
   
   VariableMetaInfo(const std::string& n, proto::VarType::Type t) : name(n), type(t) {}
 };
@@ -627,6 +633,32 @@ struct VersionedVariableInfo {
   VersionedVariableInfo(Index m, size_t v) : metainfo(m), version(v) {}
 };
 
+enum class VariableStatus : uint8_t {
+  UNALLOCATED,
+  ALLOCATED,
+  ASSIGNED
+};
+
+struct InstructionState {
+  std::atomic<Num> unallocated_input_num{std::numeric_limits<Num>::max()};
+  std::atomic<Num> unassigned_input_num{std::numeric_limits<Num>::max()};
+
+  InstructionState(Num unalloc, Num unassign) 
+      : unallocated_input_num(unalloc),
+        unassigned_input_num(unassign) {}
+
+  InstructionState(const InstructionState& ) = delete;
+
+  InstructionState(InstructionState&& state) 
+      : unallocated_input_num(state.unallocated_input_num.load()),
+        unassigned_input_num(state.unassigned_input_num.load()) {}
+};
+
+struct Register {
+  std::unique_ptr<Variable> var{nullptr};
+  VariableStatus var_status{VariableStatus::UNALLOCATED};
+};
+
 struct GraphBuildOptions {
   bool is_startup_prog = false;
 };
@@ -635,21 +667,26 @@ class ExecutorGraph {
  public:
   ExecutorGraph(const BlockDesc& block, const GraphBuildOptions& options);
 
+  std::map<std::string, proto::VarType::Type> GetParameterTypes();
+
  private:
-  void BuildVariableInfo(const BlockDesc& block, 
-                         std::unordered_map<std::string, Index>* varname2idx);
+  friend class FirstRunExecutorState;
+  friend class ExecutorState;
+  friend class AsyncExecutor;
 
-  void BuildInstructionInfo(const BlockDesc& block, 
-                            const std::unordered_map<std::string, Index>& varname2idx);
+  void BuildVariableInfo(const BlockDesc& block); 
 
-  void PopulateSchedInfo(const BlockDesc& block);
+  void BuildInstructionInfo(const BlockDesc& block); 
+
+  void PopulateSchedInfo();
 
   void PopulateExecInfo(const BlockDesc& block, 
-                        const std::vector<platform::Place>& placement_info, 
-                        const std::unordered_map<std::string, Index>& varname2idx);
+                        const std::vector<platform::Place>& placement_info); 
 
-  std::unique_ptr<RuntimeContextV2> BuildRunCtx(const std::vector<std::unique_ptr<Variable>>& vars, 
-                                              Index inst) const;
+  void BuildTriggerInstructionInfo();
+  
+  std::unique_ptr<RuntimeContextV2> BuildRunCtx(const std::vector<Register>& registers, 
+                                                Index inst) const;
 
   std::vector<Instruction> instructions_;
   std::vector<VariableMetaInfo> var_infos_;
@@ -657,13 +694,13 @@ class ExecutorGraph {
   std::vector<Index> parameters_;
   std::vector<Index> inputs_;
   std::vector<Index> outputs_;
+  std::unordered_map<std::string, Index> varname2idx_;
 };
 
 ExecutorGraph::ExecutorGraph(const BlockDesc& block, 
                              const GraphBuildOptions& options) {
-  std::unordered_map<std::string, Index> varname2idx;
-  BuildVariableInfo(block, &varname2idx);
-  BuildInstructionInfo(block, varname2idx);
+  BuildVariableInfo(block);
+  BuildInstructionInfo(block);
   if (options.is_startup_prog) {
     for (Index i = 0; i < var_infos_.size(); ++i) {
       parameters_.push_back(i);
@@ -671,35 +708,29 @@ ExecutorGraph::ExecutorGraph(const BlockDesc& block,
   }
 }
 
-void ExecutorGraph::BuildInstructionInfo(const BlockDesc& block, 
-                                         const std::unordered_map<std::string, Index>& varname2idx)
-{
+std::map<std::string, proto::VarType::Type> ExecutorGraph::GetParameterTypes() {
+  std::map<std::string, proto::VarType::Type> name_types;
+  for (Index i : parameters_) {
+    name_types[var_infos_[i].name] = var_infos_[i].type;
+  }
+  return name_types;
+}
+
+void ExecutorGraph::BuildInstructionInfo(const BlockDesc& block) { 
   size_t op_num = block.AllOps().size();
   std::vector<platform::Place> placement_info(op_num, platform::CUDAPlace(0));
-  instructions_.resize(op_num);
-  PopulateExecInfo(block, placement_info, varname2idx);
-  PopulateSchedInfo(block);
+  instructions_.resize(op_num + 1);
+  PopulateExecInfo(block, placement_info);
+  //PopulateSchedInfo();
 }
 
 void ExecutorGraph::PopulateExecInfo(const BlockDesc& block, 
-                                     const std::vector<platform::Place>& placement_info, 
-                                     const std::unordered_map<std::string, Index>& varname2idx) {
+                                     const std::vector<platform::Place>& placement_info) {
   const auto all_ops = block.AllOps();
   std::unordered_map<std::string, Index> name2version;
-  /*auto& all_op_kernels = OperatorWithKernel::AllOpKernels();
-  platform::DeviceContextPool& dev_ctx_pool = platform::DeviceContextPool::Instance();
-  Scope null_scope;
-  // vars for temp run
-  std::vector<std::unique_ptr<Variable>> local_variables;
-  for (Index i = 0; i < var_infos_.size(); ++i) {
-    auto v = new Variable();
-    InitializeVariable(v,  var_infos_[i].type);
-    local_variables.push_back(std::unique_ptr<Variable>(v));
-  }*/
-  // vars for temp run
   for (size_t i = 0; i < all_ops.size(); ++i) {
     const OpDesc& opdesc = *(all_ops[i]);
-    auto& exec_info = instructions_[i].exec_info;
+    auto& exec_info = instructions_[i + 1].exec_info;
     std::set<Index> input_dedup;
     exec_info.input_values.reserve(opdesc.Inputs().size());
     for (const auto& var_name_map : opdesc.Inputs()) {
@@ -708,7 +739,7 @@ void ExecutorGraph::PopulateExecInfo(const BlockDesc& block,
       auto& idx_vec = exec_info.input_values.back();
       idx_vec.reserve(var_name_map.second.size());
       for (const auto& var_name : var_name_map.second) {
-        const auto& iter = varname2idx.find(var_name);
+        const auto& iter = varname2idx_.find(var_name);
         Index idx = iter->second;
         idx_vec.push_back(idx);
         if (name2version.find(var_name) == name2version.end()) {
@@ -728,7 +759,7 @@ void ExecutorGraph::PopulateExecInfo(const BlockDesc& block,
       auto& idx_vec = exec_info.output_values.back();
       idx_vec.reserve(var_name_map.second.size());
       for (const auto& var_name : var_name_map.second) {
-        const auto& iter = varname2idx.find(var_name);
+        const auto& iter = varname2idx_.find(var_name);
         Index idx = iter->second;
         idx_vec.push_back(idx);
         if (name2version.find(var_name) == name2version.end()) {
@@ -746,62 +777,66 @@ void ExecutorGraph::PopulateExecInfo(const BlockDesc& block,
     exec_info.outputs.insert(exec_info.outputs.begin(), output_dedup.begin(), output_dedup.end());
     exec_info.place = placement_info[i];
     exec_info.function.operator_ptr = OpRegistry::CreateOp(opdesc);
-    // infershape, select kernel, exec kernel
-
-    /*auto kernels_iter = all_op_kernels.find(opdesc.Type());
-    PADDLE_ENFORCE_NE(kernels_iter, all_op_kernels.end(),
-                      platform::errors::Unavailable(
-                          "There are no kernels which are registered in the %s operator.",
-                          opdesc.Type()));
-    auto run_ctx_ptr = BuildRunCtx(local_variables, i);
-    const auto& op_base = *(exec_info.function.operator_ptr);
-    RuntimeInferShapeContext infershape_ctx(op_base, *run_ctx_ptr);
-    const auto& op_with_kernel = static_cast<const framework::OperatorWithKernel&>(op_base);
-    op_with_kernel.InferShape(&infershape_ctx);
-    const auto& dev_ctx = *(dev_ctx_pool.Get(exec_info.place));
-    ExecutionContextV2 exec_ctx(op_base, null_scope, dev_ctx, *run_ctx_ptr);
-    OpKernelType expected_kernel_type = op_with_kernel.GetExpectedKernelType(exec_ctx);
-    OperatorWithKernel::OpKernelMap& kernels = kernels_iter->second;
-    auto kernel_iter = kernels.find(expected_kernel_type);
-    exec_info.function.kernel_func = OpKernelFunc(kernel_iter->second);
-    exec_info.function.kernel_func(exec_ctx);
-    exec_info.place = expected_kernel_type.place_; // adjust place*/
   }
 }
 
-void ExecutorGraph::PopulateSchedInfo(const BlockDesc& block) {
+void ExecutorGraph::PopulateSchedInfo() {
   std::vector<std::vector<Index>> var_users(versioned_var_infos_.size());
-  for (Index i = 0; i < instructions_.size(); ++i) {
+  for (Index i = 1; i < instructions_.size(); ++i) {
     for (Index input : instructions_[i].exec_info.inputs) {
       var_users[input].push_back(i);
     }
   }
-  for (Index i = 0; i < instructions_.size(); ++i) {
-    const auto& outputs = instructions_[i].exec_info.outputs;
-    auto& output_user_count = instructions_[i].sched_info.output_user_count;
+  
+  for (Index i = 1; i < instructions_.size(); ++i) {
     auto& output_users = instructions_[i].sched_info.output_users;
-    output_user_count.reserve(outputs.size());
-    for (Index output : outputs) {
-      output_user_count.push_back(var_users[output].size());
-      output_users.insert(output_users.end(), var_users[output].begin(), var_users[output].end());
+    output_users.reserve(instructions_[i].exec_info.outputs.size());
+    for (Index output : instructions_[i].exec_info.outputs) {
+      output_users.push_back(var_users[output]);
     }
   }
 }
 
-void ExecutorGraph::BuildVariableInfo(const BlockDesc& block,
-                                      std::unordered_map<std::string, Index>* varname2idx) {
+void ExecutorGraph::BuildVariableInfo(const BlockDesc& block) {
   var_infos_.reserve(block.AllVars().size());
   for (const auto& var : block.AllVars()) {
     if (var->Name() == framework::kEmptyVarName) {
       continue;
     }
-    (*varname2idx)[var->Name()] = var_infos_.size();
+    varname2idx_[var->Name()] = var_infos_.size();
     var_infos_.emplace_back(var->Name(), var->GetType());
   }
 }
 
+void ExecutorGraph::BuildTriggerInstructionInfo() {
+  std::set<Index> out_vars;
+  out_vars.insert(parameters_.begin(), parameters_.end());
+  out_vars.insert(inputs_.begin(), inputs_.end());
+  std::unordered_map<Index, Index> out_ver_vars;
+  for (Index i = 0, cur = 1; i < versioned_var_infos_.size(); ++i) {
+    if (versioned_var_infos_[i].version == 1 &&
+        out_vars.find(versioned_var_infos_[i].metainfo) != out_vars.end()) {
+      out_ver_vars[i] = cur++;
+    }
+  }
+  auto& var_users = instructions_[0].sched_info.output_users;
+  var_users.resize(out_vars.size() + 1);
+  for (Index i = 1; i < instructions_.size(); ++i) {
+    if (instructions_[i].exec_info.inputs.size() == 0) {
+      var_users[0].push_back(i);
+      continue;
+    }
+    for (Index input : instructions_[i].exec_info.inputs) {
+      const auto iter = out_ver_vars.find(input);
+      if (iter != out_ver_vars.end()) {
+        var_users[iter->second].push_back(i);
+      }
+    }
+  }
+}
+
 std::unique_ptr<RuntimeContextV2> ExecutorGraph::BuildRunCtx(
-        const std::vector<std::unique_ptr<Variable>>& local_vars, Index inst_idx) const {
+        const std::vector<Register>& registers, Index inst_idx) const {
   const auto& exec_info = instructions_[inst_idx].exec_info;
   std::vector<std::vector<Variable*>> input_values;
   std::vector<std::vector<Variable*>> output_values;  
@@ -810,53 +845,468 @@ std::unique_ptr<RuntimeContextV2> ExecutorGraph::BuildRunCtx(
   for (const auto& input : exec_info.input_indexes) {
     auto& vars = input_values[input.second];
     for (Index var_idx : exec_info.input_values[input.second]) {
-      vars.push_back(local_vars[var_idx].get());
+      vars.push_back(registers[var_idx].var.get());
     }
   }
   output_values.resize(exec_info.output_indexes.size());
   for (const auto& output : exec_info.output_indexes) {
     auto& vars = output_values[output.second];
     for (Index var_idx : exec_info.output_values[output.second]) {
-      vars.push_back(local_vars[var_idx].get());
+      vars.push_back(registers[var_idx].var.get());
     }
   }
   std::unique_ptr<RuntimeContextV2> run_ctx(new RuntimeContextV2(input_values, 
-                                                             output_values, 
-                                                             exec_info.input_indexes,
-                                                             exec_info.output_indexes));
+                                                                 output_values, 
+                                                                 exec_info.input_indexes,
+                                                                 exec_info.output_indexes));
   return std::move(run_ctx);
 }
 
 // ============================ ExecutorState =====================================
-enum class VariableStatus : uint8_t {
-  UNALLOCATED,
-  ALLOCATED,
-  ASSIGNED
-};
-
-struct InstructionState {
-  std::atomic<Num> unallocated_input_num;
-  std::atomic<Num> unassigned_input_num;
-};
-
-struct Register {
-  std::unique_ptr<Variable> variable;
-  VariableStatus var_status;
-};
-
 class ExecutorState {
  public:
-  ExecutorState(const ExecutorGraph& graph, std::vector<Variable*> params);
+  ExecutorState(const ExecutorGraph& graph, 
+                const std::vector<Variable*>& params);
+
   void Run(const std::vector<Variable*>& inputs, 
-           std::vector<std::unique_ptr<Variable>>* outputs);
+           std::vector<Variable*>& outputs);
+
   std::vector<std::string> GetInputNames();
+
   std::vector<std::string> GetOutputNames();
+
   std::vector<std::string> GetParameterNames();
+
  private:
-  std::vector<InstructionState> inst_states;
-  std::vector<Register> registers;
+  void ProcessTriggerInstruction(std::vector<Index>& ready_insts);
+
+  void ProcessReadyInstructions(std::vector<Index>& ready_insts);
+
+  std::vector<InstructionState> inst_states_;
+  std::vector<Register> registers_;
   const ExecutorGraph& graph_;
 };
+
+ExecutorState::ExecutorState(const ExecutorGraph& graph, 
+                             const std::vector<Variable*>& params)
+    : graph_(graph) {
+  // registers
+  registers_.resize(graph_.var_infos_.size());
+  for (Index i = 0; i < registers_.size(); ++i) {
+    registers_[i].var = std::unique_ptr<Variable>(new Variable);
+    InitializeVariable(registers_[i].var.get(), graph_.var_infos_[i].type);
+  }
+  // inst state
+  for (Index i = 0; i < graph_.instructions_.size(); ++i) {
+    const auto& inst = graph_.instructions_[i];
+    inst_states_.emplace_back(inst.exec_info.inputs.size(), 
+                              inst.exec_info.inputs.size());
+  }
+  // copy parameters
+  for (Index i = 0; i < params.size(); ++i) {
+    const auto& src_tensor = params[i]->Get<framework::LoDTensor>();
+    if (src_tensor.IsInitialized() == false) {
+      continue;
+    }
+    auto param_idx = graph_.parameters_[i];
+    auto* dest_tensor = registers_[param_idx].var->GetMutable<framework::LoDTensor>();
+    dest_tensor->ShareDataWith(src_tensor);
+    registers_[param_idx].var_status = VariableStatus::ASSIGNED;
+  }
+}
+
+void ExecutorState::Run(const std::vector<Variable*>& inputs,
+                        std::vector<Variable*>& outputs) {
+  // copy inputs
+  for (Index i = 0; i < inputs.size(); ++i) {
+    const auto& src_tensor = inputs[i]->Get<framework::LoDTensor>();
+    if (src_tensor.IsInitialized() == false) {
+      continue;
+    }
+    auto* dest_tensor = registers_[graph_.inputs_[i]].var->GetMutable<framework::LoDTensor>();
+    dest_tensor->ShareDataWith(src_tensor);
+    registers_[graph_.inputs_[i]].var_status = VariableStatus::ASSIGNED;
+  }
+  // run insts
+  std::vector<Index> ready_insts;
+  ProcessTriggerInstruction(ready_insts);
+  ProcessReadyInstructions(ready_insts);
+  // copy outputs
+  for (Index i = 0; i < outputs.size(); ++i) {
+    const auto& src_tensor = registers_[graph_.outputs_[i]].var->Get<framework::LoDTensor>();
+    if (src_tensor.IsInitialized() == false) {
+      continue;
+    }
+    auto* dest_tensor = outputs[i]->GetMutable<framework::LoDTensor>();
+    dest_tensor->ShareDataWith(src_tensor);
+  }
+}
+
+void ExecutorState::ProcessTriggerInstruction(std::vector<Index>& ready_insts) {
+  const auto& sched_info = graph_.instructions_[0].sched_info;
+  for (auto user : sched_info.output_users[0]) {
+    ready_insts.push_back(user);
+  }
+  for (Index i = 1; i < sched_info.output_users.size(); ++i) {
+    for (auto user : sched_info.output_users[i]) {
+      if (inst_states_[user].unassigned_input_num.fetch_sub(1) == 1) {
+        ready_insts.push_back(user);
+      }
+    }
+  }
+}
+
+void ExecutorState::ProcessReadyInstructions(std::vector<Index>& ready_insts) {
+  auto& dev_ctx_pool = platform::DeviceContextPool::Instance();
+  Scope null_scope;
+  while (!ready_insts.empty()) {
+    std::vector<Index> cur_ready_insts;
+    cur_ready_insts.swap(ready_insts);
+    for (auto inst : cur_ready_insts) {
+      // exec ready inst
+      const auto& exec_info = graph_.instructions_[inst].exec_info;
+      const auto& op_base = *(exec_info.function.operator_ptr);
+      auto run_ctx_ptr = graph_.BuildRunCtx(registers_, inst);
+      RuntimeInferShapeContext infershape_ctx(op_base, *run_ctx_ptr);
+      const auto& op_with_kernel = 
+          static_cast<const framework::OperatorWithKernel&>(op_base);
+      op_with_kernel.InferShape(&infershape_ctx);
+      const auto& dev_ctx = *(dev_ctx_pool.Get(exec_info.place));
+      std::unique_ptr<ExecutionContextV2> exec_ctx_ptr(
+          new ExecutionContextV2(op_base, null_scope, dev_ctx, *run_ctx_ptr));
+      exec_info.function.kernel_func(*exec_ctx_ptr);
+      // sched ready inst
+      const auto& sched_info = graph_.instructions_[inst].sched_info;
+      for (Index i = 0; i < sched_info.output_users.size(); ++i) {
+        for (auto user : sched_info.output_users[i]) {
+          if (inst_states_[user].unassigned_input_num.fetch_sub(1) == 1) {
+            ready_insts.push_back(user);
+          }
+        }
+      }
+    }
+  }
+}
+
+class FirstRunExecutorState {
+ public:
+  FirstRunExecutorState(const std::vector<std::string>& param_names, 
+                        const std::vector<Variable*>& params,
+                        ExecutorGraph& graph);
+
+  void Run(const std::vector<std::string>& input_names, 
+           const std::vector<Variable*>& inputs, 
+           const std::vector<std::string>& output_names, 
+           std::vector<Variable*>& outputs);
+
+ private:
+  std::vector<Register> registers_;
+  ExecutorGraph& graph_;
+};
+
+FirstRunExecutorState::FirstRunExecutorState(
+    const std::vector<std::string>& param_names, 
+    const std::vector<Variable*>& params, 
+    ExecutorGraph& graph) : graph_(graph) {
+  // set graph parameters
+  graph_.parameters_.clear();
+  graph_.parameters_.resize(param_names.size());
+  for (Index i = 0; i < param_names.size(); ++i) {
+    auto iter = graph_.varname2idx_.find(param_names[i]);
+    graph_.parameters_[i] = iter->second;
+  }
+  // registers
+  registers_.resize(graph_.var_infos_.size());
+  for (Index i = 0; i < registers_.size(); ++i) {
+    registers_[i].var = std::unique_ptr<Variable>(new Variable);
+    InitializeVariable(registers_[i].var.get(), graph_.var_infos_[i].type);
+  }
+  // copy parameters
+  for (Index i = 0; i < params.size(); ++i) {
+    const auto& src_tensor = params[i]->Get<framework::LoDTensor>();
+    if (src_tensor.IsInitialized() == false) {
+      continue;
+    }
+    auto param_idx = graph_.varname2idx_[param_names[i]];
+    auto* dest_tensor = registers_[param_idx].var->GetMutable<framework::LoDTensor>();
+    dest_tensor->ShareDataWith(src_tensor);
+    registers_[param_idx].var_status = VariableStatus::ASSIGNED;
+  }
+}
+
+int convert(const platform::Place& place);
+
+void FirstRunExecutorState::Run(const std::vector<std::string>& input_names, 
+                                const std::vector<Variable*>& inputs, 
+                                const std::vector<std::string>& output_names, 
+                                std::vector<Variable*>& outputs) {
+  // set graph inputs/outputs
+  graph_.inputs_.resize(input_names.size());
+  for (Index i = 0; i < input_names.size(); ++i) {
+    auto iter = graph_.varname2idx_.find(input_names[i]);
+    graph_.inputs_[i] = iter->second;
+  }
+  graph_.outputs_.resize(output_names.size());
+  for (Index i = 0; i < output_names.size(); ++i) {
+    auto iter = graph_.varname2idx_.find(output_names[i]);
+    graph_.outputs_[i] = iter->second;
+  }
+ 
+  // copy inputs
+  for (Index i = 0; i < inputs.size(); ++i) {
+    const auto& src_tensor = inputs[i]->Get<framework::LoDTensor>();
+    if (src_tensor.IsInitialized() == false) {
+      continue;
+    }
+    auto* dest_tensor = registers_[graph_.inputs_[i]].var->GetMutable<framework::LoDTensor>();
+    dest_tensor->ShareDataWith(src_tensor);
+    registers_[graph_.inputs_[i]].var_status = VariableStatus::ASSIGNED;
+  }
+  // build and run
+  auto& all_op_kernels = OperatorWithKernel::AllOpKernels();
+  auto& dev_ctx_pool = platform::DeviceContextPool::Instance();
+  Scope null_scope;
+  size_t inst_num = graph_.instructions_.size();
+  std::vector<std::map<platform::Place, Index>> copy_vars;
+  copy_vars.resize(graph_.versioned_var_infos_.size());
+  for (Index inst = 1; inst < inst_num; ++inst) {
+    auto& exec_info = graph_.instructions_[inst].exec_info;
+    const auto& op_base = *(exec_info.function.operator_ptr);
+    auto kernels_iter = all_op_kernels.find(op_base.Type());
+    auto run_ctx_ptr = graph_.BuildRunCtx(registers_, inst);
+    RuntimeInferShapeContext infershape_ctx(op_base, *run_ctx_ptr);
+    const auto& op_with_kernel = 
+        static_cast<const framework::OperatorWithKernel&>(op_base);
+    op_with_kernel.InferShape(&infershape_ctx);
+    const auto& dev_ctx = *(dev_ctx_pool.Get(exec_info.place));
+    std::unique_ptr<ExecutionContextV2> exec_ctx_ptr(
+        new ExecutionContextV2(op_base, null_scope, dev_ctx, *run_ctx_ptr));
+    OpKernelType expected_kernel_type = op_with_kernel.GetExpectedKernelType(*exec_ctx_ptr);
+    OperatorWithKernel::OpKernelMap& kernels = kernels_iter->second;
+    auto kernel_iter = kernels.find(expected_kernel_type);
+    if (kernel_iter == kernels.end()) {
+      std::cout << "no op kernel " << std::endl;
+    }
+    exec_info.function.kernel_func = OpKernelFunc(kernel_iter->second);
+    // check inputs
+    bool inputs_changed = false;
+    for (auto& orig_input : graph_.instructions_[inst].exec_info.inputs) {
+      Index orig_var_idx = graph_.versioned_var_infos_[orig_input].metainfo;
+      const Tensor& input_tensor = registers_[orig_var_idx].var->Get<LoDTensor>();
+      if (!input_tensor.IsInitialized()) {
+        continue;
+      }
+      const auto orig_var_name = graph_.var_infos_[orig_var_idx].name;
+      auto var_type = op_with_kernel.GetKernelTypeForVar(orig_var_name, 
+                                                         input_tensor, 
+                                                         expected_kernel_type);
+      if (platform::is_same_place(var_type.place_, expected_kernel_type.place_)) {
+        continue;
+      }
+      inputs_changed = true;
+      Index copy_var_idx = 0;
+      Index copy_ver_var_idx = 0;
+      auto copy_var_place = expected_kernel_type.place_;
+      auto& copy_vars_for_orig = copy_vars[orig_input];
+      auto iter = copy_vars_for_orig.find(copy_var_place);
+      if (iter != copy_vars_for_orig.end()) {
+        copy_ver_var_idx = iter->second;
+        copy_var_idx = graph_.versioned_var_infos_[copy_ver_var_idx].metainfo;
+      }
+      else {
+        // add data-copy var
+        std::string copy_var_name = "copy_" + orig_var_name;
+        copy_var_idx = graph_.var_infos_.size();
+        graph_.var_infos_.emplace_back(copy_var_name, 
+                                       graph_.var_infos_[orig_var_idx].type);
+        copy_ver_var_idx = graph_.versioned_var_infos_.size();
+        copy_vars_for_orig[copy_var_place] = copy_ver_var_idx;
+        graph_.versioned_var_infos_.emplace_back(copy_var_idx, 1);
+        registers_.push_back(Register());
+        auto v = new Variable();
+        v->GetMutable<LoDTensor>();
+        registers_.back().var.reset(v);
+        // add data-copy op
+        Index copy_inst_idx = graph_.instructions_.size();
+        graph_.instructions_.push_back(Instruction());
+        auto& copy_inst = graph_.instructions_.back();
+        copy_inst.exec_info.inputs.push_back(orig_input);
+        copy_inst.exec_info.outputs.push_back(copy_ver_var_idx);
+        copy_inst.exec_info.input_indexes["X"] = 0;
+        copy_inst.exec_info.input_values.push_back({orig_var_idx});
+        copy_inst.exec_info.output_indexes["Out"] = 0;
+        copy_inst.exec_info.output_values.push_back({copy_var_idx});
+        copy_inst.exec_info.place = graph_.instructions_[inst].exec_info.place;
+        // exec data-copy op
+        VariableNameMap copy_input_map;
+        VariableNameMap copy_output_map;
+        AttributeMap copy_attr_map;
+        copy_input_map["X"] = {orig_var_name};
+        copy_output_map["Out"] = {copy_var_name};
+        copy_attr_map["dst_place_type"] = convert(graph_.instructions_[inst].exec_info.place);
+        auto& copy_op_info = OpInfoMap::Instance().Get("memcpy");
+        auto copy_op_base = copy_op_info.Creator()("memcpy", copy_input_map, 
+                                                   copy_output_map, copy_attr_map);
+        auto copy_run_ctx_ptr = graph_.BuildRunCtx(registers_, copy_inst_idx);
+        RuntimeInferShapeContext copy_infershape_ctx(*copy_op_base, *copy_run_ctx_ptr);
+        const auto& copy_op_with_kernel = static_cast<const OperatorWithKernel&>(*copy_op_base);
+        copy_op_with_kernel.InferShape(&copy_infershape_ctx);
+        const auto& copy_dev_ctx = *(dev_ctx_pool.Get(copy_inst.exec_info.place));
+        ExecutionContextV2 copy_exec_ctx(*copy_op_base, null_scope, copy_dev_ctx, *copy_run_ctx_ptr);
+        OpKernelType copy_expected_kernel = copy_op_with_kernel.GetExpectedKernelType(copy_exec_ctx);
+        auto copy_kernels_iter = all_op_kernels.find("memcpy");
+        OperatorWithKernel::OpKernelMap& copy_kernels = copy_kernels_iter->second;
+        auto copy_kernel_iter = copy_kernels.find(copy_expected_kernel);
+        if (copy_kernel_iter == copy_kernels.end()) {
+          std::cout << "no copy kernel " << std::endl;
+        }
+        copy_inst.exec_info.function.operator_ptr.reset(copy_op_base);
+        copy_inst.exec_info.function.kernel_func = OpKernelFunc(copy_kernel_iter->second);
+        copy_inst.exec_info.function.kernel_func(copy_exec_ctx);
+      }
+      // adjust the input
+      orig_input = copy_ver_var_idx;
+      for (auto& indexes : graph_.instructions_[inst].exec_info.input_values) {
+        for (auto& var_idx: indexes) {
+          if (var_idx == orig_var_idx) {
+            var_idx = copy_var_idx;
+          }
+        }
+      }
+    }
+    // run kernel_func
+    if (inputs_changed) {
+      run_ctx_ptr = graph_.BuildRunCtx(registers_, inst);
+      exec_ctx_ptr.reset(new ExecutionContextV2(op_base, null_scope, dev_ctx, *run_ctx_ptr));
+    }
+    graph_.instructions_[inst].exec_info.function.kernel_func(*exec_ctx_ptr);
+    graph_.instructions_[inst].exec_info.place = expected_kernel_type.place_; // adjust place
+  }
+  graph_.BuildTriggerInstructionInfo();
+  graph_.PopulateSchedInfo();
+  // copy outputs
+  for (Index i = 0; i < output_names.size(); ++i) {
+    const auto& src_tensor = registers_[graph_.outputs_[i]].var->Get<framework::LoDTensor>();
+    if (src_tensor.IsInitialized() == false) {
+      continue;
+    }
+    auto* dest_tensor = outputs[i]->GetMutable<framework::LoDTensor>();
+    dest_tensor->ShareDataWith(src_tensor);
+  }
+}
+
+// ============================ AsyncExecutor =====================================
+class AsyncExecutor {
+ public:
+  AsyncExecutor(const ProgramDesc& startup_prog, const ProgramDesc& main_prog) {
+    InitParameters(startup_prog);
+    GraphBuildOptions options;
+    graph_.reset(new ExecutorGraph(main_prog.Block(0), options));
+  }
+  
+  void TestProgramToGraph(const ProgramDesc& programdesc) {
+    std::cout << "begin to translate ProgramDesc to ExecutorGraph " << std::endl;
+    GraphBuildOptions options;
+    ExecutorGraph graph(programdesc.Block(0), options);
+    std::cout << "finish to translate ProgramDesc to ExecutorGraph " << std::endl;
+  }
+
+  void Run(const std::vector<std::string>& input_names,
+           const std::vector<framework::Tensor>& inputs,
+           const std::vector<std::string>& output_names,
+           std::vector<framework::Tensor>& outputs);
+
+  std::map<std::string, const Variable*> GetParameters();
+
+ private:
+  void InitParameters(const ProgramDesc& startup_prog); 
+
+  std::vector<Variable*> GetParameterRefs();
+
+  bool first_run_ = true;
+  std::vector<std::string> parameter_names_;
+  std::vector<std::unique_ptr<Variable>> parameters_;
+  std::unique_ptr<ExecutorGraph> graph_;
+};
+
+void AsyncExecutor::InitParameters(const ProgramDesc& startup_prog) {
+  GraphBuildOptions options;
+  options.is_startup_prog = true;
+  ExecutorGraph startup_graph(startup_prog.Block(0), options);
+
+  auto param_types = startup_graph.GetParameterTypes();
+  parameters_.reserve(param_types.size());
+  parameter_names_.reserve(param_types.size());
+  for (const auto& param_name_type : param_types) { 
+    auto param = new Variable;
+    InitializeVariable(param, param_name_type.second);
+    parameters_.push_back(std::unique_ptr<Variable>(param));
+    parameter_names_.push_back(param_name_type.first);
+  }
+  std::vector<Variable*> params(parameters_.size());
+  for (Index i = 0; i < parameters_.size(); ++i) {
+    params[i] = parameters_[i].get();
+  }
+  FirstRunExecutorState executor_state(parameter_names_, params, startup_graph);
+  executor_state.Run({}, std::vector<Variable*>(), parameter_names_, params);
+}
+
+void AsyncExecutor::Run(const std::vector<std::string>& input_names,
+                        const std::vector<framework::Tensor>& input_tensors,
+                        const std::vector<std::string>& output_names,
+                        std::vector<framework::Tensor>& output_tensors) {
+  // prepare param, inputs, outputs
+  std::vector<Variable*> params(parameters_.size());
+  for (Index i = 0; i < parameters_.size(); ++i) {
+    params[i] = parameters_[i].get();
+  }
+  std::vector<Variable*> inputs(input_names.size());
+  std::vector<Variable> input_vars(input_names.size());
+  for (Index i = 0; i < inputs.size(); ++i) {
+    auto* dest_tensor = input_vars[i].GetMutable<LoDTensor>();
+    dest_tensor->ShareDataWith(input_tensors[i]);
+    inputs[i] = &input_vars[i];
+  }
+  std::vector<Variable*> outputs(output_names.size());
+  std::vector<Variable> output_vars(output_names.size());
+  for (Index i = 0; i < outputs.size(); ++i) {
+    output_vars[i].GetMutable<LoDTensor>();
+    outputs[i] = &output_vars[i];
+  }
+
+  if (first_run_) {
+    FirstRunExecutorState exec_state(parameter_names_, params, *graph_.get());
+    exec_state.Run(input_names, inputs, output_names, outputs);
+    first_run_ = false;
+  }
+  else {
+    ExecutorState exec_state(*graph_.get(), params);
+    exec_state.Run(inputs, outputs);
+  }
+  // copy outputs
+  for (Index i = 0; i < outputs.size(); ++i) {
+    const auto& output_tensor = output_vars[i].Get<LoDTensor>();
+    if (!platform::is_cpu_place(output_tensor.place())) {
+        auto& pool = platform::DeviceContextPool::Instance();
+        auto* dev_ctx = pool.Get(output_tensor.place());
+        dev_ctx->Wait();
+        TensorCopySync(output_tensor, platform::CPUPlace(), &output_tensors[i]);
+        dev_ctx->Wait();
+    }
+    else {
+      output_tensors[i].ShareDataWith(output_tensor);
+    }
+  }
+}
+
+std::vector<Variable*> AsyncExecutor::GetParameterRefs() {
+  std::vector<Variable*> refs;
+  refs.reserve(parameters_.size());
+  for (auto& param : parameters_) {
+    refs.push_back(param.get());
+  }
+  return refs;
+}
 
 // =========================================== =====================================
 
@@ -917,6 +1367,7 @@ void build_op_func_list(const framework::ProgramDesc& pdesc,
                         const platform::Place& place) {
   auto& global_block = pdesc.Block(0);
 
+  int inst_num = 0;
   for (auto& op : global_block.AllOps()) {
     // std::cerr << op->Type() << std::endl;
     // bool debug = op->Type() == "softmax_with_cross_entropy_grad";
@@ -1102,7 +1553,6 @@ void build_op_func_list(const framework::ProgramDesc& pdesc,
           auto& copy_info = OpInfoMap::Instance().Get("memcpy");
           auto copy_op = copy_info.Creator()("memcpy", copy_in_map,
                                              copy_out_map, attr_map);
-          if (debug) std::cerr << "create memcpy" << std::endl;
           OpFuncNode copy_op_func_node;
           // copy_op_func_node.input_index = copy_ins_name2id;
           // copy_op_func_node.output_index = copy_out_name2id;
@@ -1184,6 +1634,7 @@ void build_op_func_list(const framework::ProgramDesc& pdesc,
     op_func_node.kernel_func_(exec_ctx);
     vec_func_list.push_back(op_func_node);
     if (debug) std::cerr << "5" << std::endl;
+    ++inst_num;
   }
 }
 
@@ -1268,11 +1719,6 @@ class InterpreterCore {
     std::vector<paddle::framework::OperatorBase*> op_list;
     paddle::framework::build_op_func_list(startup_prog, op_list, vec_func_list,
                                           &global_scope, place_);
-  }
-
-  void ProgramToGraph(const ProgramDesc& programdesc) {
-    GraphBuildOptions options;
-    ExecutorGraph graph(programdesc.Block(0), options);
   }
 
   void run(const std::vector<std::string> vec_name,
