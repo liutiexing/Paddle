@@ -655,7 +655,7 @@ struct InstructionState {
 };
 
 struct Register {
-  std::unique_ptr<Variable> var{nullptr};
+  Variable* var{nullptr};
   VariableStatus var_status{VariableStatus::UNALLOCATED};
 };
 
@@ -685,8 +685,11 @@ class ExecutorGraph {
 
   void BuildTriggerInstructionInfo();
   
-  std::unique_ptr<RuntimeContextV2> BuildRunCtx(const std::vector<Register>& registers, 
-                                                Index inst) const;
+  std::unique_ptr<RuntimeContextV2> BuildRunCtx(
+      const std::vector<Register>& registers, Index inst) const;
+
+  std::unique_ptr<RuntimeContextV2> BuildRunCtx(
+      std::vector<Variable>& registers, Index inst) const;
 
   std::vector<Instruction> instructions_;
   std::vector<VariableMetaInfo> var_infos_;
@@ -721,7 +724,6 @@ void ExecutorGraph::BuildInstructionInfo(const BlockDesc& block) {
   std::vector<platform::Place> placement_info(op_num, platform::CUDAPlace(0));
   instructions_.resize(op_num + 1);
   PopulateExecInfo(block, placement_info);
-  //PopulateSchedInfo();
 }
 
 void ExecutorGraph::PopulateExecInfo(const BlockDesc& block, 
@@ -845,14 +847,14 @@ std::unique_ptr<RuntimeContextV2> ExecutorGraph::BuildRunCtx(
   for (const auto& input : exec_info.input_indexes) {
     auto& vars = input_values[input.second];
     for (Index var_idx : exec_info.input_values[input.second]) {
-      vars.push_back(registers[var_idx].var.get());
+      vars.push_back(registers[var_idx].var);
     }
   }
   output_values.resize(exec_info.output_indexes.size());
   for (const auto& output : exec_info.output_indexes) {
     auto& vars = output_values[output.second];
     for (Index var_idx : exec_info.output_values[output.second]) {
-      vars.push_back(registers[var_idx].var.get());
+      vars.push_back(registers[var_idx].var);
     }
   }
   std::unique_ptr<RuntimeContextV2> run_ctx(new RuntimeContextV2(input_values, 
@@ -862,14 +864,40 @@ std::unique_ptr<RuntimeContextV2> ExecutorGraph::BuildRunCtx(
   return std::move(run_ctx);
 }
 
+std::unique_ptr<RuntimeContextV2> ExecutorGraph::BuildRunCtx(
+        std::vector<Variable>& registers, Index inst_idx) const {
+  const auto& exec_info = instructions_[inst_idx].exec_info;
+  std::vector<std::vector<Variable*>> input_values;
+  std::vector<std::vector<Variable*>> output_values;
+
+  input_values.resize(exec_info.input_indexes.size());
+  for (const auto& input : exec_info.input_indexes) {
+    auto& vars = input_values[input.second];
+    for (Index var_idx : exec_info.input_values[input.second]) {
+      vars.push_back(&registers[var_idx]);
+    }
+  }
+  output_values.resize(exec_info.output_indexes.size());
+  for (const auto& output : exec_info.output_indexes) {
+    auto& vars = output_values[output.second];
+    for (Index var_idx : exec_info.output_values[output.second]) {
+      vars.push_back(&registers[var_idx]);
+    }
+  }
+  std::unique_ptr<RuntimeContextV2> run_ctx(new RuntimeContextV2(input_values,
+                                                                 output_values,
+                                                                 exec_info.input_indexes,
+                                                                 exec_info.output_indexes));
+  return std::move(run_ctx);
+}
+
 // ============================ ExecutorState =====================================
 class ExecutorState {
  public:
   ExecutorState(const ExecutorGraph& graph, 
-                const std::vector<Variable*>& params);
+                const std::vector<Variable*>& scope);
 
-  void Run(const std::vector<Variable*>& inputs, 
-           std::vector<Variable*>& outputs);
+  void Run();
 
   std::vector<std::string> GetInputNames();
 
@@ -888,13 +916,12 @@ class ExecutorState {
 };
 
 ExecutorState::ExecutorState(const ExecutorGraph& graph, 
-                             const std::vector<Variable*>& params)
+                             const std::vector<Variable*>& scope)
     : graph_(graph) {
   // registers
   registers_.resize(graph_.var_infos_.size());
   for (Index i = 0; i < registers_.size(); ++i) {
-    registers_[i].var = std::unique_ptr<Variable>(new Variable);
-    InitializeVariable(registers_[i].var.get(), graph_.var_infos_[i].type);
+    registers_[i].var = scope[i];
   }
   // inst state
   for (Index i = 0; i < graph_.instructions_.size(); ++i) {
@@ -902,44 +929,22 @@ ExecutorState::ExecutorState(const ExecutorGraph& graph,
     inst_states_.emplace_back(inst.exec_info.inputs.size(), 
                               inst.exec_info.inputs.size());
   }
-  // copy parameters
-  for (Index i = 0; i < params.size(); ++i) {
-    const auto& src_tensor = params[i]->Get<framework::LoDTensor>();
-    if (src_tensor.IsInitialized() == false) {
-      continue;
-    }
-    auto param_idx = graph_.parameters_[i];
-    auto* dest_tensor = registers_[param_idx].var->GetMutable<framework::LoDTensor>();
-    dest_tensor->ShareDataWith(src_tensor);
-    registers_[param_idx].var_status = VariableStatus::ASSIGNED;
-  }
 }
 
-void ExecutorState::Run(const std::vector<Variable*>& inputs,
-                        std::vector<Variable*>& outputs) {
-  // copy inputs
-  for (Index i = 0; i < inputs.size(); ++i) {
-    const auto& src_tensor = inputs[i]->Get<framework::LoDTensor>();
-    if (src_tensor.IsInitialized() == false) {
+void ExecutorState::Run() {
+  // check inputs
+  for (Index i = 0; i < graph_.inputs_.size(); ++i) {
+    Index idx = graph_.inputs_[i];
+    const auto& in_tensor = registers_[idx].var->Get<framework::LoDTensor>();
+    if (in_tensor.IsInitialized() == false) {
       continue;
     }
-    auto* dest_tensor = registers_[graph_.inputs_[i]].var->GetMutable<framework::LoDTensor>();
-    dest_tensor->ShareDataWith(src_tensor);
-    registers_[graph_.inputs_[i]].var_status = VariableStatus::ASSIGNED;
+    registers_[idx].var_status = VariableStatus::ASSIGNED;
   }
   // run insts
   std::vector<Index> ready_insts;
   ProcessTriggerInstruction(ready_insts);
   ProcessReadyInstructions(ready_insts);
-  // copy outputs
-  for (Index i = 0; i < outputs.size(); ++i) {
-    const auto& src_tensor = registers_[graph_.outputs_[i]].var->Get<framework::LoDTensor>();
-    if (src_tensor.IsInitialized() == false) {
-      continue;
-    }
-    auto* dest_tensor = outputs[i]->GetMutable<framework::LoDTensor>();
-    dest_tensor->ShareDataWith(src_tensor);
-  }
 }
 
 void ExecutorState::ProcessTriggerInstruction(std::vector<Index>& ready_insts) {
@@ -1000,7 +1005,7 @@ class FirstRunExecutorState {
            std::vector<Variable*>& outputs);
 
  private:
-  std::vector<Register> registers_;
+  std::vector<Variable> registers_;
   ExecutorGraph& graph_;
 };
 
@@ -1018,8 +1023,7 @@ FirstRunExecutorState::FirstRunExecutorState(
   // registers
   registers_.resize(graph_.var_infos_.size());
   for (Index i = 0; i < registers_.size(); ++i) {
-    registers_[i].var = std::unique_ptr<Variable>(new Variable);
-    InitializeVariable(registers_[i].var.get(), graph_.var_infos_[i].type);
+    InitializeVariable(&registers_[i], graph_.var_infos_[i].type);
   }
   // copy parameters
   for (Index i = 0; i < params.size(); ++i) {
@@ -1028,9 +1032,8 @@ FirstRunExecutorState::FirstRunExecutorState(
       continue;
     }
     auto param_idx = graph_.varname2idx_[param_names[i]];
-    auto* dest_tensor = registers_[param_idx].var->GetMutable<framework::LoDTensor>();
+    auto* dest_tensor = registers_[param_idx].GetMutable<framework::LoDTensor>();
     dest_tensor->ShareDataWith(src_tensor);
-    registers_[param_idx].var_status = VariableStatus::ASSIGNED;
   }
 }
 
@@ -1058,9 +1061,8 @@ void FirstRunExecutorState::Run(const std::vector<std::string>& input_names,
     if (src_tensor.IsInitialized() == false) {
       continue;
     }
-    auto* dest_tensor = registers_[graph_.inputs_[i]].var->GetMutable<framework::LoDTensor>();
+    auto* dest_tensor = registers_[graph_.inputs_[i]].GetMutable<framework::LoDTensor>();
     dest_tensor->ShareDataWith(src_tensor);
-    registers_[graph_.inputs_[i]].var_status = VariableStatus::ASSIGNED;
   }
   // build and run
   auto& all_op_kernels = OperatorWithKernel::AllOpKernels();
@@ -1092,7 +1094,7 @@ void FirstRunExecutorState::Run(const std::vector<std::string>& input_names,
     bool inputs_changed = false;
     for (auto& orig_input : graph_.instructions_[inst].exec_info.inputs) {
       Index orig_var_idx = graph_.versioned_var_infos_[orig_input].metainfo;
-      const Tensor& input_tensor = registers_[orig_var_idx].var->Get<LoDTensor>();
+      const Tensor& input_tensor = registers_[orig_var_idx].Get<LoDTensor>();
       if (!input_tensor.IsInitialized()) {
         continue;
       }
@@ -1109,7 +1111,7 @@ void FirstRunExecutorState::Run(const std::vector<std::string>& input_names,
       auto copy_var_place = expected_kernel_type.place_;
       auto& copy_vars_for_orig = copy_vars[orig_input];
       auto iter = copy_vars_for_orig.find(copy_var_place);
-      if (iter != copy_vars_for_orig.end()) {
+      if (/*iter != copy_vars_for_orig.end()*/false) {
         copy_ver_var_idx = iter->second;
         copy_var_idx = graph_.versioned_var_infos_[copy_ver_var_idx].metainfo;
       }
@@ -1122,10 +1124,8 @@ void FirstRunExecutorState::Run(const std::vector<std::string>& input_names,
         copy_ver_var_idx = graph_.versioned_var_infos_.size();
         copy_vars_for_orig[copy_var_place] = copy_ver_var_idx;
         graph_.versioned_var_infos_.emplace_back(copy_var_idx, 1);
-        registers_.push_back(Register());
-        auto v = new Variable();
-        v->GetMutable<LoDTensor>();
-        registers_.back().var.reset(v);
+        registers_.push_back(Variable());
+        registers_.back().GetMutable<LoDTensor>();
         // add data-copy op
         Index copy_inst_idx = graph_.instructions_.size();
         graph_.instructions_.push_back(Instruction());
@@ -1186,7 +1186,7 @@ void FirstRunExecutorState::Run(const std::vector<std::string>& input_names,
   graph_.PopulateSchedInfo();
   // copy outputs
   for (Index i = 0; i < output_names.size(); ++i) {
-    const auto& src_tensor = registers_[graph_.outputs_[i]].var->Get<framework::LoDTensor>();
+    const auto& src_tensor = registers_[graph_.outputs_[i]].Get<framework::LoDTensor>();
     if (src_tensor.IsInitialized() == false) {
       continue;
     }
@@ -1199,9 +1199,9 @@ void FirstRunExecutorState::Run(const std::vector<std::string>& input_names,
 class AsyncExecutor {
  public:
   AsyncExecutor(const ProgramDesc& startup_prog, const ProgramDesc& main_prog) {
-    InitParameters(startup_prog);
     GraphBuildOptions options;
     graph_.reset(new ExecutorGraph(main_prog.Block(0), options));
+    InitParameters(startup_prog);
   }
   
   void TestProgramToGraph(const ProgramDesc& programdesc) {
@@ -1219,6 +1219,10 @@ class AsyncExecutor {
   std::map<std::string, const Variable*> GetParameters();
 
  private:
+  void InitScope(const ExecutorGraph& graph, 
+                 std::vector<Variable>& scope, 
+                 std::vector<Variable*>& scope_ref);
+
   void InitParameters(const ProgramDesc& startup_prog); 
 
   std::vector<Variable*> GetParameterRefs();
@@ -1226,8 +1230,22 @@ class AsyncExecutor {
   bool first_run_ = true;
   std::vector<std::string> parameter_names_;
   std::vector<std::unique_ptr<Variable>> parameters_;
+  std::vector<Variable*> scope_ref_;
+  std::vector<Variable> scope_;
   std::unique_ptr<ExecutorGraph> graph_;
 };
+
+void AsyncExecutor::InitScope(const ExecutorGraph& graph, 
+                              std::vector<Variable>& scope, 
+                              std::vector<Variable*>& scope_ref) {
+  Num var_num = graph.var_infos_.size();
+  scope.resize(var_num);
+  scope_ref.resize(var_num);
+  for (Index i = 0; i < var_num; ++i) {
+    InitializeVariable(&scope[i], graph_->var_infos_[i].type);
+    scope_ref[i] = &scope[i];
+  }
+}
 
 void AsyncExecutor::InitParameters(const ProgramDesc& startup_prog) {
   GraphBuildOptions options;
@@ -1255,37 +1273,53 @@ void AsyncExecutor::Run(const std::vector<std::string>& input_names,
                         const std::vector<framework::Tensor>& input_tensors,
                         const std::vector<std::string>& output_names,
                         std::vector<framework::Tensor>& output_tensors) {
-  // prepare param, inputs, outputs
-  std::vector<Variable*> params(parameters_.size());
-  for (Index i = 0; i < parameters_.size(); ++i) {
-    params[i] = parameters_[i].get();
-  }
-  std::vector<Variable*> inputs(input_names.size());
-  std::vector<Variable> input_vars(input_names.size());
-  for (Index i = 0; i < inputs.size(); ++i) {
-    auto* dest_tensor = input_vars[i].GetMutable<LoDTensor>();
-    dest_tensor->ShareDataWith(input_tensors[i]);
-    inputs[i] = &input_vars[i];
-  }
-  std::vector<Variable*> outputs(output_names.size());
-  std::vector<Variable> output_vars(output_names.size());
-  for (Index i = 0; i < outputs.size(); ++i) {
-    output_vars[i].GetMutable<LoDTensor>();
-    outputs[i] = &output_vars[i];
-  }
-
   if (first_run_) {
+    // prepare param, inputs, outputs
+    std::vector<Variable*> params(parameters_.size());
+    for (Index i = 0; i < parameters_.size(); ++i) {
+      params[i] = parameters_[i].get();
+    }
+    std::vector<Variable*> inputs(input_names.size());
+    std::vector<Variable> input_vars(input_names.size());
+    for (Index i = 0; i < inputs.size(); ++i) {
+      auto* dest_tensor = input_vars[i].GetMutable<LoDTensor>();
+      dest_tensor->ShareDataWith(input_tensors[i]);
+      inputs[i] = &input_vars[i];
+    }
+    std::vector<Variable*> outputs(output_tensors.size());
+    std::vector<Variable> output_vars(output_names.size());
+    for (Index i = 0; i < outputs.size(); ++i) {
+      output_vars[i].GetMutable<LoDTensor>();
+      outputs[i] = &output_vars[i];
+    }
+    // first run
     FirstRunExecutorState exec_state(parameter_names_, params, *graph_.get());
     exec_state.Run(input_names, inputs, output_names, outputs);
+    // process 
     first_run_ = false;
+    InitScope(*graph_, scope_, scope_ref_);
+    for (Index i = 0; i < graph_->parameters_.size(); ++i) {
+      auto* param = scope_[graph_->parameters_[i]].GetMutable<LoDTensor>();
+      param->ShareDataWith(parameters_[i]->Get<framework::LoDTensor>());
+    }
+    for (Index i = 0; i < graph_->outputs_.size(); ++i) {
+      auto* output = scope_[graph_->outputs_[i]].GetMutable<LoDTensor>();
+      output->ShareDataWith(output_vars[i].Get<framework::LoDTensor>());
+    }
   }
   else {
-    ExecutorState exec_state(*graph_.get(), params);
-    exec_state.Run(inputs, outputs);
+    // prepare inputs
+    for (Index i = 0; i < input_tensors.size(); ++i) {
+      auto* dest_tensor = scope_[graph_->inputs_[i]].GetMutable<LoDTensor>();
+      dest_tensor->ShareDataWith(input_tensors[i]);
+    }
+    // run
+    ExecutorState exec_state(*graph_.get(), scope_ref_);
+    exec_state.Run();
   }
   // copy outputs
-  for (Index i = 0; i < outputs.size(); ++i) {
-    const auto& output_tensor = output_vars[i].Get<LoDTensor>();
+  for (Index i = 0; i < graph_->outputs_.size(); ++i) {
+    const auto& output_tensor = scope_[graph_->outputs_[i]].Get<LoDTensor>();
     if (!platform::is_cpu_place(output_tensor.place())) {
         auto& pool = platform::DeviceContextPool::Instance();
         auto* dev_ctx = pool.Get(output_tensor.place());
